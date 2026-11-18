@@ -6,9 +6,9 @@ Page layout
     combination (sortable table, CSV download, optional two-parameter pivot).
   * Backtest engine (below): the original section 1 / section 2 workflow.
 
-Positional long/short backtest on Yahoo Finance data (timeframe selectable in the sidebar: 1 minute to 1 day),
+Positional long/short backtest on daily Yahoo Finance data,
 for one stock or an equal-capital portfolio of any number of stocks, with:
-  * sideways-market "no-trade zone" filters (ER, ADX, Vortex),
+  * sideways-market "no-trade zone" filters (ER, ADX, Vortex crossover),
   * heat-map based parameter estimation on a training window (section 1),
     evaluated out of sample on a backtest window (section 2).
 
@@ -26,7 +26,7 @@ Speed-ups compared with the previous version
   * results and figures are kept in session state, so touching a widget only
     re-draws the page; the heavy work runs only when "Run backtest" is pressed.
 
-Run with:  streamlit run main.py
+Run with:  streamlit run ma_backtesting_engine.py
 """
 from __future__ import annotations
 
@@ -61,18 +61,8 @@ MAX_SMA_LEN = 400          # largest SMA length selectable in the sidebar
 # Extra calendar days downloaded before each start date so that every indicator
 # (SMA up to 400 bars, ADX smoothing ~5x period) is fully warmed up on day one.
 WARMUP_DAYS = 1500
+VI_PERIOD = 14              # lookback of the Vortex indicator used by the Vortex crossover filter
 CHART_MARGIN = dict(l=0, r=0, t=30, b=0)
-
-# Timeframe (bar size). Each entry: label, how far back Yahoo Finance serves that bar size (calendar days,
-# None = no limit) and the calendar days of warm-up history downloaded before a start date.
-INTERVALS = {
-    "1m": ("1 minute", 29, 3),
-    "5m": ("5 minutes", 59, 10),
-    "15m": ("15 minutes", 59, 30),
-    "30m": ("30 minutes", 59, 60),
-    "1h": ("1 hour", 729, 120),
-    "1d": ("1 day", None, WARMUP_DAYS),
-}
 
 M_PLATEAU = "Best neighbourhood average (stable plateau)"
 M_RAW = "Highest raw return"
@@ -102,12 +92,12 @@ class Config:
     adx_n: int
     adx_min: float
     use_vi_cross: bool
-    use_vi_band: bool
-    vi_n: int
-    vi_lo: float
-    vi_hi: float
     cost_pct: float           # per side, % of trade value
     timeline: tuple = ()      # allowed trading date ranges ((from, to), ...); empty = trade throughout
+
+
+# How the capital is split across the stocks of a portfolio
+ALLOC_EQUAL, ALLOC_INVVOL = "Split equally", "Split by inverse volatility"
 
 
 @dataclass(frozen=True)
@@ -140,9 +130,10 @@ class Inputs:
     smas: list[int]
     cfg: Config
     timeline_error: str = ""
-    interval: str = "1d"
     profiles: dict = field(default_factory=dict)       # ticker -> Profile
     active: str = ""
+    alloc_method: str = ALLOC_EQUAL                    # how the capital is split across the stocks
+    vol_lookback: int = 60                             # bars of history used by the inverse-volatility split
 
     @property
     def label(self) -> str:
@@ -199,75 +190,21 @@ class Results:
 # ---------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------
-def earliest_allowed(interval: str) -> date | None:
-    """Oldest start date Yahoo Finance serves for this bar size (None = no limit)."""
-    limit = INTERVALS[interval][1]
-    return None if limit is None else date.today() - timedelta(days=limit)
-
-
-def interval_problems(interval: str, start: date, end: date) -> list[str]:
-    earliest = earliest_allowed(interval)
-    if earliest is not None and start < earliest:
-        label, limit = INTERVALS[interval][0], INTERVALS[interval][1]
-        return [f"Yahoo Finance only provides {label} bars for about the last {limit + 1} days, so the start date "
-                f"must be {earliest} or later (it is {start}). Move the dates, or pick a longer timeframe."]
-    return []
-
-
-def periods_per_year(index: pd.DatetimeIndex, interval: str) -> float:
-    """Bars per year, used to annualise Sharpe / Sortino / volatility. Daily keeps 252; for intraday bars it is
-    measured from the data itself, so it fits any exchange's trading hours."""
-    if interval == "1d" or len(index) < 2:
-        return float(TRADING_DAYS)
-    years = (index[-1] - index[0]).total_seconds() / (365.25 * 86400)
-    return len(index) / years if years > 0 else float(TRADING_DAYS)
-
-
-def _download(ticker: str, start: date, end: date, interval: str) -> pd.DataFrame:
-    df = yf.download(ticker, start=start, end=end, interval=interval, auto_adjust=True, progress=False)
+@st.cache_data(show_spinner="Downloading prices...", ttl=3600)
+def load_span(ticker: str, lo: date, hi: date) -> pd.DataFrame:
+    """Auto-adjusted daily OHLC from `lo` - warm-up days to `hi` (inclusive)."""
+    df = yf.download(ticker, start=lo - timedelta(days=WARMUP_DAYS), end=hi + timedelta(days=1),
+                     auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df.dropna()
 
 
-@st.cache_data(show_spinner="Downloading prices...", ttl=3600)
-def load_span(ticker: str, lo: date, hi: date, interval: str = "1d") -> pd.DataFrame:
-    """Auto-adjusted OHLC bars of the chosen timeframe from `lo` - warm-up days to `hi` (inclusive).
-    Intraday history is limited by Yahoo (see INTERVALS), so the download starts no earlier than that limit."""
-    first = lo - timedelta(days=INTERVALS[interval][2])
-    last = hi + timedelta(days=1)
-    earliest = earliest_allowed(interval)
-    if earliest is not None:
-        first = max(first, earliest)
-        last = min(last, date.today() + timedelta(days=1))
-    if first >= last:
-        return pd.DataFrame()
-
-    if interval == "1m":                                   # Yahoo serves at most 7 days of 1-minute bars per request
-        parts, cur = [], first
-        while cur < last:
-            nxt = min(cur + timedelta(days=7), last)
-            parts.append(_download(ticker, cur, nxt, interval))
-            cur = nxt
-        parts = [x for x in parts if not x.empty]
-        df = pd.concat(parts) if parts else pd.DataFrame()
-    else:
-        df = _download(ticker, first, last, interval)
-    if df.empty:
-        return df
-
-    if getattr(df.index, "tz", None) is not None:           # keep exchange-local wall-clock time, drop the zone
-        df.index = df.index.tz_localize(None)
-    return df[~df.index.duplicated()].sort_index()
-
-
-def price_window(span: pd.DataFrame, start: date, end: date, interval: str = "1d") -> pd.DataFrame:
-    """`start` - warm-up .. end of day `end`, sliced from the downloaded span."""
+def price_window(span: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """`start` - warm-up .. `end`, sliced from the downloaded span."""
     if span.empty:
         return span
-    lo = pd.Timestamp(start - timedelta(days=INTERVALS[interval][2]))
-    hi = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(1, "ns")
-    return span.loc[lo:hi]
+    return span.loc[pd.Timestamp(start - timedelta(days=WARMUP_DAYS)):pd.Timestamp(end)]
 
 
 # ---------------------------------------------------------------
@@ -318,12 +255,11 @@ def sma_values(close: np.ndarray, n: int) -> np.ndarray:
 
 
 # Which no-trade condition fired (bit flags, so several can be true on one bar)
-NT_ER, NT_ADX, NT_VI_CROSS, NT_VI_BAND, NT_TIMELINE = 1, 2, 4, 8, 16
+NT_ER, NT_ADX, NT_VI_CROSS, NT_TIMELINE = 1, 2, 4, 8
 NT_NAMES = {
     NT_ER: "Efficiency Ratio below threshold",
     NT_ADX: "ADX below threshold",
     NT_VI_CROSS: "Vortex: +VI below -VI",
-    NT_VI_BAND: "Vortex: inside the no-trade band",
     NT_TIMELINE: "Outside the trading timeline",
 }
 
@@ -341,14 +277,10 @@ def no_trade_parts(df: pd.DataFrame, cfg: Config) -> tuple[np.ndarray, dict[str,
         adx_series = adx(df, cfg.adx_n)
         ind["ADX"] = adx_series
         bits |= ((adx_series < cfg.adx_min) | adx_series.isna()).to_numpy().astype(np.int64) * NT_ADX
-    if cfg.use_vi_cross or cfg.use_vi_band:
-        vi_p, vi_m = vortex(df, cfg.vi_n)
+    if cfg.use_vi_cross:
+        vi_p, vi_m = vortex(df, VI_PERIOD)
         ind["+VI"], ind["-VI"] = vi_p, vi_m
-        if cfg.use_vi_cross:
-            bits |= (vi_p < vi_m).fillna(False).to_numpy().astype(np.int64) * NT_VI_CROSS
-        if cfg.use_vi_band:
-            in_band = vi_p.between(cfg.vi_lo, cfg.vi_hi) & vi_m.between(cfg.vi_lo, cfg.vi_hi)
-            bits |= in_band.fillna(False).to_numpy().astype(np.int64) * NT_VI_BAND
+        bits |= (vi_p < vi_m).fillna(False).to_numpy().astype(np.int64) * NT_VI_CROSS
     return bits, ind
 
 
@@ -364,7 +296,7 @@ def off_timeline_mask(index: pd.DatetimeIndex, cfg: Config) -> np.ndarray:
         return np.zeros(len(index), dtype=bool)
     ok = np.zeros(len(index), dtype=bool)
     for a, b in cfg.timeline:
-        ok |= (index >= pd.Timestamp(a)) & (index <= pd.Timestamp(b) + pd.Timedelta(days=1) - pd.Timedelta(1, "ns"))
+        ok |= (index >= pd.Timestamp(a)) & (index <= pd.Timestamp(b))
     return ~ok
 
 
@@ -530,7 +462,7 @@ def returns_from_equity(equity: np.ndarray, capital: float) -> np.ndarray:
 
 @st.cache_data(show_spinner="Running EMA/SMA grid on section 1...", hash_funcs={Config: astuple})
 def run_grid(tickers: tuple[str, ...], span_lo: date, span_hi: date, start: date, end: date,
-             emas: list[int], smas: list[int], cfg: Config, capital: float, interval: str = "1d"):
+             emas: list[int], smas: list[int], cfg: Config, capital: float):
     """Backtest every EMA < SMA pair on an equal-capital portfolio of `tickers` (one sleeve per stock).
     Returns (avg annual return, max drawdown, yearly returns), all measured on the combined portfolio equity."""
     ret_grid = np.full((len(emas), len(smas)), np.nan)
@@ -543,7 +475,7 @@ def run_grid(tickers: tuple[str, ...], span_lo: date, span_hi: date, start: date
 
     stocks: list[dict] = []
     for tk in tickers:
-        prices = price_window(load_span(tk, span_lo, span_hi, interval), start, end, interval)
+        prices = price_window(load_span(tk, span_lo, span_hi), start, end)
         if prices.empty:
             continue
         i0 = int(prices.index.searchsorted(pd.Timestamp(start)))
@@ -800,6 +732,33 @@ def portfolio_label(tickers: tuple[str, ...]) -> str:
 MARKETS = {"NSE (.NS)": ".NS", "BSE (.BO)": ".BO", "As typed (no suffix)": ""}
 
 
+def allocation_weights(pre_closes: dict[str, np.ndarray], method: str, lookback: int
+                       ) -> tuple[dict[str, float], dict[str, float], list[str]]:
+    """Share of the capital each stock gets, plus the per-bar volatility used and the stocks that lacked history.
+    Inverse volatility: weight is proportional to 1 / (standard deviation of the stock's last `lookback` bar returns
+    before the backtest start), so every stock contributes a similar amount of risk. Only data from before the
+    backtest start is used, so there is no look-ahead. The weights are fixed for the whole backtest (no
+    rebalancing). A stock without enough history is given the average volatility of the others."""
+    names = list(pre_closes)
+    equal = {t: 1.0 / len(names) for t in names}
+    vols = {t: np.nan for t in names}
+    if method != ALLOC_INVVOL or len(names) == 1:
+        return equal, vols, []
+    for t, close in pre_closes.items():
+        c = close[-(lookback + 1):]
+        ret = c[1:] / c[:-1] - 1.0 if len(c) > 1 else np.array([])
+        if len(ret) >= 5 and np.std(ret) > 0:
+            vols[t] = float(np.std(ret, ddof=1))
+    known = [v for v in vols.values() if np.isfinite(v)]
+    missing = [t for t, v in vols.items() if not np.isfinite(v)]
+    if not known:
+        return equal, vols, missing
+    fill = float(np.mean(known))
+    inv = {t: 1.0 / (vols[t] if np.isfinite(vols[t]) else fill) for t in names}
+    total = sum(inv.values())
+    return {t: v / total for t, v in inv.items()}, vols, missing
+
+
 def parse_tickers(text: str, suffix: str = "") -> tuple[str, ...]:
     """'reliance, tcs .NS' -> ('RELIANCE.NS', 'TCS.NS'): upper-cased, a stray '.NS' joined to the name before it,
     `suffix` added to names that have no dot, duplicates removed, order kept."""
@@ -909,14 +868,13 @@ SIDEBAR_KEYS = {
     "allow_short": "sb_allow_short", "exit_filter": "sb_exit_filter",
     "use_er": "sb_use_er", "er_n": "sb_er_n", "er_min": "sb_er_min",
     "use_adx": "sb_use_adx", "adx_n": "sb_adx_n", "adx_min": "sb_adx_min",
-    "use_vi_cross": "sb_use_vi_cross", "use_vi_band": "sb_use_vi_band", "vi_n": "sb_vi_n",
-    "vi_lo": "sb_vi_lo", "vi_hi": "sb_vi_hi", "cost_pct": "sb_cost_pct",
+    "use_vi_cross": "sb_use_vi_cross", "cost_pct": "sb_cost_pct",
 }
 SIDEBAR_DEFAULTS = {
     "sb_use_estimated": True, "sb_man_ema": 20, "sb_man_sma": 50, "sb_stop_pct": 0.0,
     "sb_allow_short": True, "sb_exit_filter": True, "sb_use_er": True, "sb_er_n": 10, "sb_er_min": 0.25,
     "sb_use_adx": False, "sb_adx_n": 14, "sb_adx_min": 20.0, "sb_use_vi_cross": False,
-    "sb_use_vi_band": False, "sb_vi_n": 14, "sb_vi_lo": 0.9, "sb_vi_hi": 1.1, "sb_cost_pct": 0.05,
+    "sb_cost_pct": 0.05,
     "sb_method": METHOD_NAMES[0], "sb_tickers": "RELIANCE", "sb_market": "NSE (.NS)",
 }
 # Every widget that belongs to a ticker's own profile
@@ -985,8 +943,7 @@ def profile_from_values(v: dict, timeline: tuple) -> Profile:
         allow_short=bool(g("sb_allow_short")), exit_filter=bool(g("sb_exit_filter")), stop_pct=float(g("sb_stop_pct")),
         use_er=bool(g("sb_use_er")), er_n=int(g("sb_er_n")), er_min=float(g("sb_er_min")),
         use_adx=bool(g("sb_use_adx")), adx_n=int(g("sb_adx_n")), adx_min=float(g("sb_adx_min")),
-        use_vi_cross=bool(g("sb_use_vi_cross")), use_vi_band=bool(g("sb_use_vi_band")), vi_n=int(g("sb_vi_n")),
-        vi_lo=float(g("sb_vi_lo")), vi_hi=float(g("sb_vi_hi")), cost_pct=float(g("sb_cost_pct")), timeline=timeline)
+        use_vi_cross=bool(g("sb_use_vi_cross")), cost_pct=float(g("sb_cost_pct")), timeline=timeline)
     method = g("sb_method") if g("sb_method") in METHOD_NAMES else METHOD_NAMES[0]
     return Profile(cfg, int(g("sb_man_ema")), int(g("sb_man_sma")), bool(g("sb_use_estimated")), method)
 
@@ -1018,14 +975,15 @@ def canon_inputs(inp: Inputs) -> Inputs:
 def sidebar_inputs() -> Inputs:
     sb = st.sidebar
     ensure_defaults()
-    sb.caption("Build: permutations + stop loss + copy row + timeframe + portfolio + ticker profiles")
+    sb.caption("Build: permutations + stop loss + copy row + portfolio + ticker profiles + inverse-vol split (daily)")
 
     sb.header("Data")
     sb.text_area(
         "Tickers (one per line or comma separated)", key="sb_tickers", height=110,
         help="Add as many stocks as you like, for example RELIANCE, TCS, INFY. Every ticker gets its own parameter "
              "profile (switch between them in the 'Ticker profiles' section at the top of the page). The backtest "
-             "is a portfolio: the capital is split equally and every stock trades its own profile.")
+             "is a portfolio: the capital is split across the stocks (equally or by inverse volatility, set "
+             "below) and every stock trades its own profile.")
     sb.selectbox(
         "Market (suffix added to tickers that have none)", list(MARKETS), key="sb_market",
         help="Yahoo Finance needs .NS for NSE and .BO for BSE stocks. The suffix is added to every ticker that has "
@@ -1034,21 +992,20 @@ def sidebar_inputs() -> Inputs:
     tickers = current_tickers()
     if tickers:
         sb.caption("Using: " + ", ".join(tickers[:12]) + (f" ... (+{len(tickers) - 12} more)" if len(tickers) > 12 else ""))
-    capital = sb.number_input("Initial capital (split equally across the stocks)", value=100000.0, step=10000.0)
+    capital = sb.number_input("Initial capital (total, split across the stocks)", value=100000.0, step=10000.0)
+    alloc_method = sb.selectbox(
+        "Capital split across the stocks", [ALLOC_EQUAL, ALLOC_INVVOL], key="sb_alloc",
+        help="Split equally: every stock gets the same amount. Split by inverse volatility: each stock's share is "
+             "proportional to 1 / its volatility, so calmer stocks get more capital and wilder ones less, and "
+             "every stock contributes a similar amount of risk. The volatility is measured only on data before the "
+             "backtest start, and the weights stay fixed (no rebalancing). Only matters with 2 or more tickers.")
+    vol_lookback = sb.number_input(
+        "Volatility lookback (bars before the backtest start)", 5, 1000, 60, key="sb_vol_lb",
+        disabled=alloc_method != ALLOC_INVVOL,
+        help="How many bars of returns are used to measure each stock's volatility for the inverse-volatility split.")
     if len(tickers) > 1:
-        sb.caption(f"{len(tickers)} stocks: {capital / len(tickers):,.0f} capital per stock.")
-    interval = sb.selectbox(
-        "Timeframe (bar size)", list(INTERVALS), index=list(INTERVALS).index("1d"),
-        format_func=lambda k: INTERVALS[k][0], key="sb_interval",
-        help="Size of each price bar. All lengths (EMA, SMA, ER, ADX, Vortex) are counted in bars of this size. "
-             "Yahoo Finance only keeps recent history for intraday bars: 1 minute about 30 days, 5/15/30 minutes "
-             "about 60 days, 1 hour about 2 years.")
-    earliest = earliest_allowed(interval)
-    if earliest is not None:
-        sb.caption(f"{INTERVALS[interval][0]} bars: Yahoo data starts {earliest}. Use dates from then on. "
-                   "Annualised figures are extrapolated from a short window; compare runs on total return "
-                   "and max drawdown.")
-
+        sb.caption(f"{len(tickers)} stocks: " + (f"{capital / len(tickers):,.0f} capital per stock."
+                   if alloc_method == ALLOC_EQUAL else "weights are shown in the results (Portfolio analysis)."))
     sb.header("Section 1: Historical training dates")
     use_train = sb.checkbox("Enable section 1 (use to estimate best parameters)", value=True)
     train_start = sb.date_input("Training start", date(2010, 1, 1), key="ts", disabled=not use_train)
@@ -1094,7 +1051,7 @@ def sidebar_inputs() -> Inputs:
     sb.header("Stop loss")
     stop_pct = sb.number_input(
         "Stop loss (% from entry, 0 = off)", 0.0, 50.0, step=0.5, key="sb_stop_pct",
-        help="Checked on bar closes: a long exits at the first close at or below entry x (1 - stop), "
+        help="Checked on daily closes: a long exits at the first close at or below entry x (1 - stop), "
              "a short at the first close at or above entry x (1 + stop). The exit is that bar's close, "
              "so it can be worse than the stop level after a gap. No re-entry until the next crossover.")
 
@@ -1110,12 +1067,8 @@ def sidebar_inputs() -> Inputs:
     use_adx = sb.checkbox("ADX filter (no trade when ADX < threshold)", key="sb_use_adx")
     adx_n = sb.number_input("ADX period", 2, 100, key="sb_adx_n", disabled=not use_adx)
     adx_min = sb.slider("ADX threshold", 5.0, 50.0, step=0.5, key="sb_adx_min", disabled=not use_adx)
-    with sb.expander("Vortex filters (optional)"):
-        vi_n = st.number_input("Vortex lookback period", 2, 100, key="sb_vi_n")
-        use_vi_cross = st.checkbox("No trade when +VI < -VI", key="sb_use_vi_cross")
-        use_vi_band = st.checkbox("No trade when VI is inside band", key="sb_use_vi_band")
-        vi_lo = st.number_input("Band lower bound", step=0.05, key="sb_vi_lo", disabled=not use_vi_band)
-        vi_hi = st.number_input("Band upper bound", step=0.05, key="sb_vi_hi", disabled=not use_vi_band)
+    use_vi_cross = sb.checkbox("Vortex filter (no trade when +VI < -VI)", key="sb_use_vi_cross",
+                               help=f"Uses the standard {VI_PERIOD}-day Vortex indicator.")
 
     sb.header("Costs and risk")
     cost_pct = sb.number_input(
@@ -1133,8 +1086,7 @@ def sidebar_inputs() -> Inputs:
         allow_short=allow_short, exit_filter=exit_filter, stop_pct=float(stop_pct),
         use_er=use_er, er_n=int(er_n), er_min=float(er_min),
         use_adx=use_adx, adx_n=int(adx_n), adx_min=float(adx_min),
-        use_vi_cross=use_vi_cross, use_vi_band=use_vi_band, vi_n=int(vi_n),
-        vi_lo=float(vi_lo), vi_hi=float(vi_hi), cost_pct=float(cost_pct), timeline=timeline,
+        use_vi_cross=use_vi_cross, cost_pct=float(cost_pct), timeline=timeline,
     )
     store = st.session_state.setdefault("profiles", {})
     if active in tickers:
@@ -1147,7 +1099,8 @@ def sidebar_inputs() -> Inputs:
         man_ema=int(man_ema), man_sma=int(man_sma),
         emas=list(range(int(ema_lo), int(ema_hi) + 1, int(ema_step))),
         smas=list(range(int(sma_lo), int(sma_hi) + 1, int(sma_step))),
-        cfg=cfg, timeline_error=timeline_error, interval=interval, profiles=profiles, active=active,
+        cfg=cfg, timeline_error=timeline_error, profiles=profiles, active=active,
+        alloc_method=alloc_method, vol_lookback=int(vol_lookback),
     )
 
 
@@ -1166,9 +1119,6 @@ def date_problems(inp: Inputs) -> list[str]:
         problems.append("Enter at least one ticker.")
     if inp.test_start >= inp.test_end or (inp.use_train and inp.train_start >= inp.train_end):
         problems.append("Start date must be before end date in each enabled section.")
-    problems += interval_problems(inp.interval, inp.test_start, inp.test_end)
-    if inp.use_train:
-        problems += [f"Section 1: {x}" for x in interval_problems(inp.interval, inp.train_start, inp.train_end)]
     problems += timeline_problems(inp, inp.test_start, inp.test_end)
     return problems
 
@@ -1232,9 +1182,6 @@ def price_figure(sig: pd.DataFrame, ind: dict[str, pd.Series], cfg: Config,
         row += 1
         fig.add_trace(go.Scatter(x=sig.index, y=ind["+VI"].reindex(sig.index), name="+VI"), row=row, col=1)
         fig.add_trace(go.Scatter(x=sig.index, y=ind["-VI"].reindex(sig.index), name="-VI"), row=row, col=1)
-        if cfg.use_vi_band:
-            for level in (cfg.vi_lo, cfg.vi_hi):
-                fig.add_hline(y=level, line_dash="dot", line_color="grey", row=row, col=1)
 
     # One full-height rectangle per no-trade run (yref="paper" spans every panel).
     # Building the shapes list directly is far faster than add_vrect(row="all").
@@ -1322,20 +1269,16 @@ def compute_all(inp: Inputs) -> Results:
     spans: dict[str, pd.DataFrame] = {}
     skipped: list[tuple[str, str]] = []
     for tk in inp.tickers:
-        span = load_span(tk, lo, hi, inp.interval)
+        span = load_span(tk, lo, hi)
         if span.empty:
             skipped.append((tk, "no price data in the selected dates (check the symbol: NSE tickers end in .NS)"))
         else:
             spans[tk] = span
     if not spans:
-        raise UserError(f"No {INTERVALS[inp.interval][0]} price data found for {', '.join(inp.tickers)} "
+        raise UserError(f"No price data found for {', '.join(inp.tickers)} "
                         "in the selected dates. Check the symbols: NSE tickers end in .NS.")
 
     messages: list[tuple[str, str]] = []
-    if inp.interval != "1d":
-        messages.append(("info", f"Timeframe: {INTERVALS[inp.interval][0]} bars. Every length is counted in bars; "
-                                 "annualised figures (avg annual return, Sharpe, volatility) are extrapolated "
-                                 "from the selected window."))
     if inp.use_train and inp.train_end > inp.test_start:
         messages.append(("warning", "Section 1 overlaps section 2, so the backtest is not fully out of sample."))
 
@@ -1357,7 +1300,7 @@ def compute_all(inp: Inputs) -> Results:
         if inp.use_train:
             sec.ret_grid, sec.dd_grid, yearly = run_grid(
                 (tk,), lo, hi, inp.train_start, inp.train_end, inp.emas, inp.smas,
-                replace(prof.cfg, timeline=()), grid_capital, inp.interval)
+                replace(prof.cfg, timeline=()), grid_capital)
             sec.ratio_grid = sec.ret_grid / sec.dd_grid.abs().replace(0, np.nan)
             sec.methods = best_pairs(sec.ret_grid, sec.ratio_grid)
             consistent = consistency_pair(yearly)
@@ -1392,21 +1335,36 @@ def compute_all(inp: Inputs) -> Results:
 
     # --- Section 2: out-of-sample backtest, one equal-capital sleeve per stock ---
     windows: dict[str, pd.DataFrame] = {}
+    starts: dict[str, int] = {}
     for tk, span in spans.items():
-        w = price_window(span, inp.test_start, inp.test_end, inp.interval)
+        w = price_window(span, inp.test_start, inp.test_end)
         i0 = int(w.index.searchsorted(pd.Timestamp(inp.test_start))) if not w.empty else 0
         if w.empty or len(w) - i0 < 2:
             skipped.append((tk, "not enough bars inside the backtest range"))
         else:
-            windows[tk] = w
+            windows[tk], starts[tk] = w, i0
     if not windows:
         raise UserError("No data for the selected ticker(s) and backtest range.")
-    alloc = inp.capital / len(windows)
-    ppy_stock = lambda ix: periods_per_year(ix, inp.interval)
+    ppy_stock = lambda ix: float(TRADING_DAYS)
+
+    # Capital split: equal, or by inverse volatility measured only on bars before the backtest start
+    weights, vols, lacking = allocation_weights(
+        {tk: w["Close"].to_numpy(dtype=float)[:starts[tk]] for tk, w in windows.items()},
+        inp.alloc_method, inp.vol_lookback)
+    alloc_of = {tk: inp.capital * weights[tk] for tk in windows}
+    if inp.alloc_method == ALLOC_INVVOL and len(windows) > 1:
+        if len(lacking) == len(windows):
+            messages.append(("warning", "No stock had enough price history before the backtest start to measure "
+                                        "volatility, so the capital was split equally."))
+        elif lacking:
+            messages.append(("warning", f"{', '.join(lacking)}: not enough price history before the backtest start "
+                                        "to measure volatility, so the average volatility of the other stocks was "
+                                        "used for its weight."))
 
     sleeves: dict[str, Sleeve] = {}
     for tk, w in windows.items():
         cfg_t, (ema_t, sma_t) = inp.profiles[tk].cfg, pairs[tk]
+        alloc = alloc_of[tk]
         sig_i, ind_i = section2_frame(w, ema_t, sma_t, cfg_t, alloc, inp.test_start)
         trades_i = build_trades(sig_i, cfg_t.cost_pct, cfg_t.stop_pct)
         if not trades_i.empty:
@@ -1417,7 +1375,7 @@ def compute_all(inp: Inputs) -> Results:
 
     names = list(sleeves)
     union = union_index([sl.sig.index for sl in sleeves.values()])
-    parts = [{"index": sl.sig.index, "alloc": alloc, "equity": sl.sig["equity"].to_numpy(),
+    parts = [{"index": sl.sig.index, "alloc": sl.alloc, "equity": sl.sig["equity"].to_numpy(),
               "equity_gross": sl.sig["equity_gross"].to_numpy(), "position": sl.sig["position"].to_numpy(),
               "buyhold": sl.sig["buyhold"].to_numpy()} for sl in sleeves.values()]
     comb = combine_sleeves(union, parts, inp.capital)
@@ -1429,7 +1387,7 @@ def compute_all(inp: Inputs) -> Results:
     metrics = portfolio_metrics(psig, trades, inp.capital, inp.rf_pct, ppy, comb,
                                 [sl.metrics for sl in sleeves.values()])
 
-    allocs = np.full(len(names), alloc)
+    allocs = np.array([sleeves[t].alloc for t in names])
     stats = portfolio_stats(comb, names, allocs, inp.capital, ppy)
     metrics.update(n_stocks=len(names), div_ratio=stats["div_ratio"], avg_corr=stats["avg_corr"],
                    wavg_vol=stats["wavg_vol"])
@@ -1438,6 +1396,7 @@ def compute_all(inp: Inputs) -> Results:
         "Stock": names,
         "EMA length": [sl.ema_len for sl in sleeves.values()],
         "SMA length": [sl.sma_len for sl in sleeves.values()],
+        "Weight %": allocs / inp.capital * 100,
         "Capital allocated": allocs,
         "Final equity": final_eq,
         "Net PnL": final_eq - allocs,
@@ -1451,12 +1410,20 @@ def compute_all(inp: Inputs) -> Results:
         "Contribution to portfolio return (pp)": (final_eq - allocs) / inp.capital * 100,
         "Share of portfolio risk %": stats["risk_share"],
     })
+    if inp.alloc_method == ALLOC_INVVOL and len(names) > 1:
+        stock_table.insert(3, "Volatility used for sizing %", [vols[t] * np.sqrt(ppy) * 100 for t in names])
     sleeve_equity = pd.DataFrame(comb["sleeve_eq"].T, index=union, columns=names)
 
     if len(names) > 1:
-        messages.insert(0, ("info", f"Portfolio of {len(names)} stocks: capital {inp.capital:,.0f} split equally "
-                                    f"({alloc:,.0f} per stock). Every stock trades its own parameter profile "
-                                    "independently; no rebalancing. Portfolio metrics use the combined equity curve."))
+        if inp.alloc_method == ALLOC_INVVOL:
+            split = (f"split by inverse volatility ({inp.vol_lookback}-bar lookback before the backtest start): "
+                     + ", ".join(f"{t} {weights[t] * 100:.1f}%" for t in names[:10])
+                     + (f" ... (+{len(names) - 10} more)" if len(names) > 10 else ""))
+        else:
+            split = f"split equally ({inp.capital / len(names):,.0f} per stock)"
+        messages.insert(0, ("info", f"Portfolio of {len(names)} stocks: capital {inp.capital:,.0f} {split}. "
+                                    "Every stock trades its own parameter profile independently; no rebalancing. "
+                                    "Portfolio metrics use the combined equity curve."))
     for tk, why in skipped:
         messages.append(("warning", f"{tk}: {why}, so it was left out of the portfolio."))
 
@@ -1573,19 +1540,23 @@ def render_best_pairs(res: Results, tk: str) -> None:
 
 def render_portfolio_analysis(res: Results) -> None:
     m, n = res.metrics, len(res.sleeves)
-    alloc = res.inp.capital / n
+    weights = res.stock_table["Weight %"]
+    inv = res.inp.alloc_method == ALLOC_INVVOL
     st.subheader("Portfolio analysis")
-    st.caption(f"{n} stocks with {alloc:,.0f} capital each. Each stock trades the same strategy on its own capital "
+    st.caption(f"{n} stocks, capital " + ("split by inverse volatility (weights in the table below). " if inv
+                                          else f"split equally ({res.inp.capital / n:,.0f} each). ")
+               + "Each stock trades its own parameter profile on its own capital "
                "(no rebalancing) and the portfolio equity is the sum of the stock equities. Return, volatility, "
                "Sharpe, Sortino, drawdown and Calmar above are measured on that combined equity curve, so "
                "diversification is already in them. Trade statistics pool every stock's trades.")
     metric_row([
         ("Stocks", f"{n}"),
-        ("Capital per stock", f"{alloc:,.0f}"),
+        ("Capital split", "Inverse volatility" if inv else "Equal"),
+        ("Weights (max / min)", f"{weights.max():.1f}% / {weights.min():.1f}%"),
         ("Portfolio volatility", fmt(m["vol"], "%", 1)),
-        ("Avg stock volatility", fmt(m["wavg_vol"], "%", 1), "Capital-weighted average of the stocks' own annualised volatilities."),
         ("Diversification ratio", fmt(m["div_ratio"]),
-         "Average stock volatility / portfolio volatility. Above 1 means combining the stocks reduced risk."),
+         "Capital-weighted average stock volatility / portfolio volatility. Above 1 means combining the stocks "
+         "reduced risk."),
         ("Avg pairwise correlation", fmt(m["avg_corr"]),
          "Average correlation between the stocks' strategy returns (lower = more diversification)."),
     ])
@@ -1672,9 +1643,6 @@ _DEPENDS = {
     "er_min": (lambda v: v["use_er"], "not used (ER filter off)"),
     "adx_n": (lambda v: v["use_adx"], "not used (ADX filter off)"),
     "adx_min": (lambda v: v["use_adx"], "not used (ADX filter off)"),
-    "vi_n": (lambda v: v["use_vi_cross"] or v["use_vi_band"], "not used (Vortex filters off)"),
-    "vi_lo": (lambda v: v["use_vi_band"], "not used (Vortex band off)"),
-    "vi_hi": (lambda v: v["use_vi_band"], "not used (Vortex band off)"),
     "stop_pct": (lambda v: v["stop_pct"] > 0, "Off"),
 }
 
@@ -1746,10 +1714,10 @@ def perm_export_sheets(perm: dict, ids: list[int], metric_keys: list[str]) -> di
     a, b = perm["window"]
     info = pd.DataFrame({
         "Item": ["Tickers", "Evaluation window", "Initial capital", "Risk-free rate (%)", "Combinations run",
-                 "Runs exported", "Trading timeline", "Stop loss rule", "Timeframe", "Capital per stock"],
+                 "Runs exported", "Trading timeline", "Stop loss rule", "Capital per stock"],
         "Value": [", ".join(perm["tickers"]), f"{a} to {b}", perm["capital"], perm["rf"], perm["n"], len(ids),
-                  perm["timeline"], "Checked on bar closes; exit at that close",
-                  INTERVALS[perm.get("interval", "1d")][0], perm["capital"] / max(1, len(perm["tickers"]))],
+                  perm["timeline"], "Checked on daily closes; exit at that close",
+                  perm["capital"] / max(1, len(perm["tickers"]))],
     })
     return {"Selected runs": pd.concat([runs, met], axis=1),
             "Parameter setup": pd.DataFrame(perm["setup"]), "Run info": info}
@@ -1762,9 +1730,9 @@ def backtest_export_sheets(res: Results) -> dict[str, pd.DataFrame]:
     first = next(iter(res.sleeves.values()))
     setup = [
         ("Tickers", ", ".join(res.sleeves)),
-        ("Timeframe", INTERVALS[inp.interval][0]),
         ("Initial capital", inp.capital),
-        ("Capital per stock (equal split)", inp.capital / len(res.sleeves)),
+        ("Capital split", inp.alloc_method + (f" ({inp.vol_lookback}-bar lookback before the backtest start)"
+                                              if inp.alloc_method == ALLOC_INVVOL and multi else "")),
         ("Risk-free rate (%)", inp.rf_pct),
         ("Backtest dates (section 2)", f"{inp.test_start} to {inp.test_end}"),
         ("Trading timeline", describe_timeline(first.cfg)),
@@ -1777,7 +1745,7 @@ def backtest_export_sheets(res: Results) -> dict[str, pd.DataFrame]:
         for label, v in param_row({**asdict(first.cfg), "ema_len": first.ema_len, "sma_len": first.sma_len}).items():
             rows.append({"Group": specs[label].group, "Parameter": label, "Value": v})
         rows.append({"Group": "Entry / exit rules", "Parameter": "Stop loss rule",
-                     "Value": "Checked on bar closes; exit at that close"})
+                     "Value": "Checked on daily closes; exit at that close"})
 
     sig = res.sig
     vals = {**m, "net_pnl": sig["equity"].iloc[-1] - inp.capital,
@@ -1837,12 +1805,6 @@ PARAM_SPECS = [
     ParamSpec("adx_min", "ADX threshold", "float", "No-trade filters", (5, 50), (15, 30, 5),
               tuple(range(5, 51, 5))),
     ParamSpec("use_vi_cross", "Vortex: no trade when +VI < -VI", "bool", "No-trade filters"),
-    ParamSpec("use_vi_band", "Vortex: no trade inside band", "bool", "No-trade filters"),
-    ParamSpec("vi_n", "Vortex lookback", "int", "No-trade filters", (2, 100), (10, 20, 2)),
-    ParamSpec("vi_lo", "Vortex band lower", "float", "No-trade filters", (0.5, 1.0), (0.8, 1.0, 0.05),
-              (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)),
-    ParamSpec("vi_hi", "Vortex band upper", "float", "No-trade filters", (1.0, 1.5), (1.0, 1.2, 0.05),
-              (1.0, 1.1, 1.2, 1.3, 1.4, 1.5)),
     ParamSpec("cost_pct", "Trading cost per side (%)", "float", "Costs", (0.0, 5.0), (0.0, 0.2, 0.05),
               (0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5)),
 ]
@@ -1898,10 +1860,6 @@ def canonical(c: dict) -> dict:
         off |= {"er_n", "er_min"}
     if not c["use_adx"]:
         off |= {"adx_n", "adx_min"}
-    if not (c["use_vi_cross"] or c["use_vi_band"]):
-        off.add("vi_n")
-    if not c["use_vi_band"]:
-        off |= {"vi_lo", "vi_hi"}
     for k in off:
         c[k] = None
     return c
@@ -1948,9 +1906,8 @@ def fast_trades(pos: np.ndarray, close: np.ndarray, cost_pct: float) -> pd.DataF
 class SweepData:
     """Price arrays plus memoised EMA / SMA / no-trade series shared by every combination."""
 
-    def __init__(self, prices: pd.DataFrame, start: date, interval: str = "1d"):
+    def __init__(self, prices: pd.DataFrame, start: date):
         self.prices = prices
-        self.interval = interval
         self.close = prices["Close"].to_numpy(dtype=float)
         self.i0 = int(prices.index.searchsorted(pd.Timestamp(start)))
         if len(self.close) - self.i0 < 2:
@@ -1971,7 +1928,7 @@ class SweepData:
 
     def blocked(self, cfg: Config) -> np.ndarray:
         key = ("blk", cfg.use_er, cfg.er_n, cfg.er_min, cfg.use_adx, cfg.adx_n, cfg.adx_min,
-               cfg.use_vi_cross, cfg.use_vi_band, cfg.vi_n, cfg.vi_lo, cfg.vi_hi)
+               cfg.use_vi_cross)
         return self._get(key, lambda: no_trade_mask(self.prices, cfg)[0].to_numpy(dtype=bool))
 
     def off(self, cfg: Config) -> np.ndarray:
@@ -1983,12 +1940,12 @@ class PortfolioSweep:
     portfolio of one). Each stock gets capital / n, trades independently, and the metrics are computed on
     the combined equity curve."""
 
-    def __init__(self, members: list[tuple[str, SweepData]], capital: float, interval: str):
+    def __init__(self, members: list[tuple[str, SweepData]], capital: float):
         self.members = members
         self.alloc = capital / len(members)
         self.union = union_index([sd.idx for _, sd in members])
         self.takes = [carry_map(sd.idx, self.union) for _, sd in members]
-        self.ppy = periods_per_year(self.union, interval)
+        self.ppy = float(TRADING_DAYS)
 
     def evaluate(self, ema_len: int, sma_len: int, cfg: Config, capital: float, rf_pct: float) -> dict:
         n_bars = len(self.union)
@@ -2028,18 +1985,18 @@ def run_permutations(inp: Inputs, start: date, end: date, combos: list[dict], fi
     members: list[tuple[str, SweepData]] = []
     skipped: list[tuple[str, str]] = []
     for tk in inp.tickers:
-        span = load_span(tk, start, end, inp.interval)
-        prices = price_window(span, start, end, inp.interval) if not span.empty else span
+        span = load_span(tk, start, end)
+        prices = price_window(span, start, end) if not span.empty else span
         if prices.empty:
             skipped.append((tk, "no price data in the selected dates"))
             continue
         try:
-            members.append((tk, SweepData(prices, start, inp.interval)))
+            members.append((tk, SweepData(prices, start)))
         except UserError:
             skipped.append((tk, "not enough bars inside the evaluation range"))
     if not members:
         raise UserError(f"No price data found for {', '.join(inp.tickers)} in the selected dates.")
-    data = PortfolioSweep(members, inp.capital, inp.interval)
+    data = PortfolioSweep(members, inp.capital)
 
     swept = [k for k, v in axes.items() if len(v) > 1]
     bar = st.progress(0.0, text="Running permutations...")
@@ -2068,7 +2025,7 @@ def run_permutations(inp: Inputs, start: date, end: date, combos: list[dict], fi
             "setup": setup, "swept": swept, "n": len(combos),
             "ticker": portfolio_label(tuple(t for t, _ in members)), "tickers": [t for t, _ in members],
             "skipped": skipped, "file_tag": members[0][0] if len(members) == 1 else f"portfolio_{len(members)}_stocks",
-            "interval": inp.interval, "window": (start, end), "capital": inp.capital, "rf": inp.rf_pct,
+            "window": (start, end), "capital": inp.capital, "rf": inp.rf_pct,
             "timeline": describe_timeline(inp.cfg)}
 
 
@@ -2218,7 +2175,7 @@ def render_perm_results(perm: dict, metrics: list[str]) -> None:
     for tk, why in perm.get("skipped", []):
         st.warning(f"{tk}: {why}, so it was left out of the portfolio.")
     n_st = len(perm.get("tickers", [None]))
-    st.caption(f"{perm['ticker']}{' (equal capital per stock)' if n_st > 1 else ''}, {INTERVALS[perm.get('interval', '1d')][0]} bars, {a} to {b}. {perm['n']:,} combinations. Varied: {varied}. "
+    st.caption(f"{perm['ticker']}{' (equal capital per stock)' if n_st > 1 else ''}, {a} to {b}. {perm['n']:,} combinations. Varied: {varied}. "
                "A blank parameter cell means that setting was switched off in that row.")
     k1, k2 = st.columns([3, 2])
     tk = perm["tickers"][0]
@@ -2368,10 +2325,9 @@ def render_permutations(inp: Inputs) -> None:
         errors.append("The evaluation start date must be before the end date.")
     if not inp.tickers:
         errors.append("Enter at least one ticker in the sidebar.")
-    errors += interval_problems(inp.interval, start, end)
     errors += timeline_problems(inp, start, end)
 
-    max_combos = st.number_input("Maximum combinations allowed", 1, 100000, 5000, step=500, key="perm_max",
+    max_combos = st.number_input("Maximum combinations allowed", 1, 2000000, 5000, step=500, key="perm_max",
                                  help="Safety limit on the number of raw combinations, "
                                       "to avoid accidentally launching a huge run.")
     raw = math.prod(len(v) for v in axes.values())
@@ -2470,7 +2426,7 @@ def render_profile_section(inp: Inputs) -> bool:
             "EMA/SMA from": "Section 1 estimate" if (p.use_estimated and inp.use_train) else "Manual / best fit",
             "Stop %": c.stop_pct, "Short": "On" if c.allow_short else "Off",
             "ER": "On" if c.use_er else "Off", "ADX": "On" if c.use_adx else "Off",
-            "Vortex": "On" if (c.use_vi_cross or c.use_vi_band) else "Off", "Cost %": c.cost_pct,
+            "Vortex": "On" if c.use_vi_cross else "Off", "Cost %": c.cost_pct,
             "Permutations run": "yes" if tk in perms else "no",
             "Best fit applied": f"run #{copied[tk][0]}" if tk in copied else "",
         })
